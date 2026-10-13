@@ -1,66 +1,80 @@
 #!/usr/bin/env python3
 """
-jellyfin_porzadkuj.py
+organize.py — organize a TV series library and tag it with TMDB identifiers.
 
-Porządkuje bibliotekę seriali dokumentalnych pod Jellyfin, operując na NAS-ie
-po SSH (find + mkdir -p + mv; bez SFTP). Dopasowania TMDB liczone są lokalnie.
+Runs LOCALLY on the NAS (e.g. as a Synology Task Scheduler job). The library
+root (--dir) holds one folder per show. A single run does the whole job:
 
-Program NIE modyfikuje zawartości plików — wykonuje wyłącznie:
-  - tworzenie katalogów (mkdir -p),
-  - przenoszenie i zmianę nazw plików (mv).
+  * the TMDB identifier goes on the SERIES FOLDER, which is renamed in place:
+        Rick and Morty  ->  Rick and Morty (2013) [tmdbid-60625]
+    (the folder is renamed on disk; its contents are not moved),
+  * EPISODE files inside are renamed in place to a tidy pattern, with the
+    proper show title and a standardized marker — WITHOUT an id (the id lives
+    on the folder):
+        rick.and.morty.s01e01.PL.1080p.mkv  ->  Rick and Morty S01E01.PL.1080p.mkv
+  * folders that ALREADY carry an id are still scanned (unlike jmovies), so
+    newly added episodes get tidied up; the id is then read straight from the
+    folder name without querying TMDB,
+  * a small cache (keyed by tmdbid) remembers each show's episode count; an
+    id-tagged folder whose count has not changed since the last run is skipped
+    entirely (no TMDB call, no re-scan). Add one episode (20 -> 21) and the
+    folder is scanned again. The cache is written only in --apply runs.
+  * if a target name is already taken (collision), nothing is overwritten:
+    a " - duplicateN" suffix is added and the event is logged,
+  * episode files with no detectable season/episode marker are reported and
+    left untouched; nothing is ever deleted,
+  * the run (start / progress / finish) is written to a log file and printed
+    to the console.
 
-Docelowa struktura:
-  Nazwa serialu (ROK) [tmdbid-XXXXX]/
-    Season 01/
-      Nazwa serialu S01E01.PL.1080i.HDTV.H264-B89.ts
+Usage:
+  python3 organize.py --dir /volume1/video/Series            # preview
+  python3 organize.py --dir /volume1/video/Series --apply    # execute
 
-Domyślnie działa w trybie PODGLĄDU. Faktyczne zmiany: flaga --apply.
+TMDB key: --api-key flag, TMDB_API_KEY environment variable, or the
+tmdb_api_key entry in config.txt located next to the script.
 """
 
 import argparse
-import datetime
 import json
+import logging
 import os
 import re
-import shlex
 import sys
 import unicodedata
 
 try:
-    import paramiko
-except ImportError:
-    print('Brak biblioteki paramiko. Uruchom przez ./uruchom_jellyfin.sh', file=sys.stderr)
-    sys.exit(1)
-try:
     import requests
 except ImportError:
-    print('Brak biblioteki requests. Uruchom przez ./uruchom_jellyfin.sh', file=sys.stderr)
+    print('Missing the requests library. Install it: pip3 install requests', file=sys.stderr)
     sys.exit(1)
 
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 VIDEO_EXT = {'.ts', '.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.mpg', '.mpeg', '.m2ts'}
 
-# --- Rozpoznawanie sezonu/odcinka ---
+RE_TMDBID = re.compile(r'\[tmdbid-(\d+)\]', re.IGNORECASE)
+RE_YEAR_PAREN = re.compile(r'\((?:19|20)\d{2}\)')
+RE_YEAR_BARE = re.compile(r'(?<![0-9])(?:19|20)\d{2}(?![0-9])')
+
+# Episode markers:
 # S01E01, S01.E01, s01e01, S01 E01
 RE_SXE = re.compile(r'[Ss](\d{1,2})[ ._\-]*[Ee](\d{1,2})')
-# 1x01  (wymaga cyfry przed x i dokładnie 2 cyfr odcinka -> nie łapie 1920x1080)
+# 1x01 (digit before x, exactly 2 episode digits -> does not catch 1920x1080)
 RE_AXB = re.compile(r'(?<!\d)(\d{1,2})[xX](\d{2})(?!\d)')
-# Samo E01 / EP01 / Ep 1  (lookbehind odrzuca "E" z S01E01)
+# bare E01 / EP01 / Ep 1 (lookbehind rejects the "E" of S01E01)
 RE_EP = re.compile(r'(?<![A-Za-z0-9])[Ee][Pp]?\s*\.?\s*(\d{1,3})(?![A-Za-z0-9])')
-# Polskie CZ1 / Cz 2 / Część 3
+# Część 2 / Cz 2
 RE_CZ = re.compile(r'(?<![A-Za-z0-9])(?:CZ|Cz|Część|Czesc|CZĘŚĆ)\s*\.?\s*(\d{1,3})(?![A-Za-z0-9])')
 # Part 2 / Pt 2 / Odcinek 2 / Odc 2
 RE_PART = re.compile(r'(?<![A-Za-z0-9])(?:Part|Pt|Odcinek|Odc)\s*\.?\s*(\d{1,3})(?![A-Za-z0-9])',
                      re.IGNORECASE)
-
-RE_TMDBID = re.compile(r'\[tmdbid-(\d+)\]', re.IGNORECASE)
+# Season folder: "Season 1" / "Sezon 01" / "S1"
 RE_SEASON_DIR = re.compile(r'^(?:season|sezon)\s*0*(\d{1,2})$', re.IGNORECASE)
 RE_SDIR_SHORT = re.compile(r'^s\s*0*(\d{1,2})$', re.IGNORECASE)
-RE_YEAR_PAREN = re.compile(r'\((?:19|20)\d{2}\)')
-RE_YEAR_BARE = re.compile(r'(?<![0-9])(?:19|20)\d{2}(?![0-9])')
 
-# Znane tagi release — używane do odcięcia tytułu od części technicznej,
-# także gdy znacznik odcinka stoi w środku (np. Singapur.PL.CZ2.1080i...)
+# Known release tags — used to split the title from the technical part,
+# even when the episode marker sits in the middle (e.g. Show.PL.CZ2.1080i...)
 _RELEASE = (r'(?:PL|ENG|EN|MULTi|LEKTOR|NAPISY|NAPiSY|DUB|SUB|2160p|1080p|1080i|720p|720i|'
             r'576p|540p|480p|UHD|UHDTV|HDTV|HDR10|HDR|DV|SDR|WEB-?DL|WEBRip|WEB|BluRay|'
             r'Blu-?Ray|BDRip|BRRip|DVDRip|HDRip|REMUX|HEVC|AVC|x264|x265|h264|h265|H\.264|'
@@ -68,7 +82,7 @@ _RELEASE = (r'(?:PL|ENG|EN|MULTi|LEKTOR|NAPISY|NAPiSY|DUB|SUB|2160p|1080p|1080i|
             r'FLAC|MA|5\.1|2\.0|B89|MR)')
 RE_RELEASE_TOKEN = re.compile(r'(?<![A-Za-z0-9])' + _RELEASE + r'(?![A-Za-z0-9])', re.IGNORECASE)
 
-# Słowa release będące samymi literami (do odróżnienia od TYTUŁU odcinka).
+# Release words made of plain letters (to tell them apart from an episode TITLE).
 RELEASE_WORDS = {
     'pl', 'eng', 'en', 'multi', 'lektor', 'napisy', 'dub', 'sub', 'uhd', 'uhdtv',
     'hdtv', 'hdr', 'hdr10', 'dv', 'sdr', 'web', 'webrip', 'webdl', 'dl', 'bluray',
@@ -78,8 +92,10 @@ RELEASE_WORDS = {
     'ma', 'mr', 'hd', 'sd',
 }
 
+log = logging.getLogger('jseries')
 
-# --------------------------- konfiguracja ---------------------------
+
+# --------------------------- configuration ---------------------------
 
 def read_config(path):
     cfg = {}
@@ -96,7 +112,7 @@ def read_config(path):
 
 
 def load_cache(path):
-    """Wczytuje trwały cache dopasowań TMDB (tylko udane wpisy)."""
+    """Load the scan cache: {tmdbid(str): {'name','year','count'}}."""
     if not path or not os.path.isfile(path):
         return {}
     try:
@@ -104,81 +120,23 @@ def load_cache(path):
             data = json.load(fh)
     except (OSError, ValueError):
         return {}
-    return {k: v for k, v in data.items() if isinstance(v, dict) and v.get('ok')}
+    return {k: v for k, v in data.items()
+            if isinstance(v, dict) and isinstance(v.get('count'), int)}
 
 
 def save_cache(path, cache):
-    """Zapisuje do cache tylko rozwiązane (udane) dopasowania."""
     if not path:
         return
-    ok = {k: v for k, v in cache.items() if isinstance(v, dict) and v.get('ok')}
     try:
         tmp = path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as fh:
-            json.dump(ok, fh, ensure_ascii=False, indent=0, sort_keys=True)
+            json.dump(cache, fh, ensure_ascii=False, indent=0, sort_keys=True)
         os.replace(tmp, path)
     except OSError as exc:
-        print(f'Uwaga: nie udało się zapisać cache ({exc}).', file=sys.stderr)
+        log.warning('Could not write cache (%s): %s', path, exc)
 
 
-def write_log(path, root, apply, plan, moved, skipped_exist, apply_output,
-              collisions, skipped_files, unresolved):
-    """Dopisuje wpis o przebiegu do pliku logów."""
-    if not path:
-        return
-    ts = datetime.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
-    lines = ['=' * 60,
-             f'{ts}  tryb={"WYKONANIE" if apply else "PODGLĄD"}  biblioteka={root}',
-             f'Zaplanowano zmian: {len(plan)}']
-    for src, dest in plan:
-        lines.append(f'  {src}')
-        lines.append(f'    -> {dest}')
-    if apply:
-        lines.append(f'Wynik: przeniesiono {moved}, pominięto (istniały) {skipped_exist}')
-        for ln in (apply_output or '').splitlines():
-            lines.append('  ' + ln)
-    if collisions:
-        lines.append(f'Kolizje: {len(collisions)}')
-        for src, other, dest in collisions:
-            lines.append(f'  {src}')
-            lines.append(f'  ORAZ {other}')
-            lines.append(f'  -> {dest}')
-    if skipped_files:
-        lines.append(f'Pominięte pliki: {len(skipped_files)}')
-        for full, why in skipped_files:
-            lines.append(f'  [{why}] {full}')
-    if unresolved:
-        lines.append(f'Bez jednoznacznego dopasowania TMDB: {len(unresolved)}')
-        for query, hint, reason, cands, nfiles in unresolved:
-            hint_s = f', rok z folderu: {hint}' if hint else ''
-            lines.append(f'  "{query}" — {reason}{hint_s} ({nfiles} plik(ów))')
-            for c in cands:
-                lines.append(f'      {c["name"]} ({c["year"]}) tmdbid-{c["id"]}')
-    lines.append('')
-    try:
-        with open(path, 'a', encoding='utf-8') as fh:
-            fh.write('\n'.join(lines) + '\n')
-    except OSError as exc:
-        print(f'Uwaga: nie udało się zapisać logu ({exc}).', file=sys.stderr)
-
-
-def load_overrides(path):
-    out = {}
-    if not path or not os.path.isfile(path):
-        return out
-    with open(path, encoding='utf-8') as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith('#') or '=' not in line:
-                continue
-            left, right = line.split('=', 1)
-            right = right.strip()
-            if right.isdigit():
-                out[normalize(left.strip())] = int(right)
-    return out
-
-
-# --------------------------- tekst / nazwy ---------------------------
+# --------------------------- text / names ---------------------------
 
 def normalize(s):
     s = unicodedata.normalize('NFKD', s)
@@ -198,7 +156,7 @@ def clean_query(raw):
     s = RE_TMDBID.sub('', raw)
     s = re.sub(r'[._]+', ' ', s)
     s = RE_YEAR_PAREN.sub('', s)
-    s = re.sub(r'(?<![A-Za-z0-9])(?:19|20)\d{2}(?![A-Za-z0-9])', '', s)
+    s = RE_YEAR_BARE.sub('', s)
     s = re.sub(r'\[[^\]]*\]', '', s)
     s = re.sub(r'\s{2,}', ' ', s)
     return s.strip(' -')
@@ -217,9 +175,9 @@ def strip_sep(s):
 
 
 def looks_like_title(tail):
-    """True, jeśli tekst po znaczniku to TYTUŁ odcinka (np. 'Ice Cream', 'Lody'),
-    a nie tagi release — czyli zawiera zwykłe słowo (same litery, >=3), którego
-    nie ma w słowniku tagów release."""
+    """True if the text after the marker is an episode TITLE (e.g. 'Ice Cream')
+    rather than release tags — i.e. it contains a plain word (letters only, >=3)
+    that is not in the release-tag dictionary."""
     if not tail:
         return False
     for t in re.split(r'[.\s_\-]+', tail):
@@ -229,7 +187,7 @@ def looks_like_title(tail):
 
 
 def find_marker(stem):
-    """Zwraca (start, end, sezon_lub_None, odcinek) najwcześniejszego znacznika."""
+    """Return (start, end, season_or_None, episode) of the earliest marker."""
     cands = []
     m = RE_SXE.search(stem)
     if m:
@@ -247,7 +205,7 @@ def find_marker(stem):
 
 
 def parse_file(base, season_hint):
-    """Zwraca (sezon, odcinek, tytul_z_pliku, czesc_release, ext) albo None."""
+    """Return (season, episode, title_from_file, release, ext) or None."""
     stem, ext = os.path.splitext(base)
     mk = find_marker(stem)
     if not mk:
@@ -259,13 +217,13 @@ def parse_file(base, season_hint):
     before = stem[:start]
     after = strip_sep(stem[end:])
 
-    # Odrzuć tytuł odcinka po znaczniku (np. ".Ice Cream", ".Lody", "_Denim"),
-    # zachowując tylko tagi release. Dzięki temu duplikaty tego samego odcinka
-    # dostają identyczną nazwę i nie mnożą się w folderze.
+    # Drop the episode title after the marker (e.g. ".Ice Cream", "_Denim"),
+    # keeping only release tags. This way duplicates of the same episode get
+    # an identical name instead of multiplying.
     if looks_like_title(after):
         after = ''
 
-    # Jeśli przed znacznikiem są już tagi release (np. "PL"), dołącz je do części technicznej
+    # If release tags already precede the marker (e.g. "PL"), keep them.
     rel_m = RE_RELEASE_TOKEN.search(before)
     if rel_m:
         pre_rel = strip_sep(before[rel_m.start():])
@@ -274,54 +232,16 @@ def parse_file(base, season_hint):
         pre_rel = ''
         title_part = before
 
-    rel_parts = [p for p in (pre_rel, after) if p]
-    release = '.'.join(rel_parts)
+    release = '.'.join(p for p in (pre_rel, after) if p)
     return season, episode, clean_query(title_part), release, ext
-
-
-def parse_unnumbered(base):
-    """Dla pliku bez numeru: dzieli nazwę na tytuł i część release po pierwszym
-    znanym tagu release. Zwraca (tytul, release, ext)."""
-    stem, ext = os.path.splitext(base)
-    m = RE_RELEASE_TOKEN.search(stem)
-    if m:
-        title = stem[:m.start()]
-        release = strip_sep(stem[m.start():])
-    else:
-        title = stem
-        release = ''
-    return clean_query(title), release, ext
 
 
 def season_from_path(ancestors):
     for part in ancestors:
-        p = part.strip()
-        m = RE_SEASON_DIR.match(p) or RE_SDIR_SHORT.match(p)
+        m = RE_SEASON_DIR.match(part.strip()) or RE_SDIR_SHORT.match(part.strip())
         if m:
             return int(m.group(1))
     return None
-
-
-def series_source_name(ancestors, title_from_file):
-    for part in ancestors:
-        p = part.strip()
-        if RE_SEASON_DIR.match(p) or RE_SDIR_SHORT.match(p):
-            continue
-        q = clean_query(part)
-        if q:
-            return q
-    return title_from_file
-
-
-def series_year_hint(ancestors, title_raw):
-    for part in ancestors:
-        p = part.strip()
-        if RE_SEASON_DIR.match(p) or RE_SDIR_SHORT.match(p):
-            continue
-        y = year_from_text(part)
-        if y:
-            return y
-    return year_from_text(title_raw or '')
 
 
 # --------------------------- TMDB ---------------------------
@@ -358,15 +278,18 @@ class Tmdb:
         return r.json()
 
 
-def to_result(data):
-    name = data.get('name') or data.get('original_name') or ''
-    return {'ok': True, 'id': data.get('id'),
-            'name': sanitize_name(name),
-            'year': (data.get('first_air_date') or '')[:4]}
+def _name(r):
+    return r.get('name') or r.get('original_name') or ''
 
 
 def _yr(r):
     return (r.get('first_air_date') or '')[:4]
+
+
+def to_result(data):
+    return {'ok': True, 'id': data.get('id'),
+            'name': sanitize_name(_name(data)),
+            'year': _yr(data)}
 
 
 def pick_candidate(results, nquery, hint_year):
@@ -383,7 +306,6 @@ def pick_candidate(results, nquery, hint_year):
         ay = [r for r in results if _yr(r) == hint_year]
         if len(ay) == 1:
             return ay[0]
-        # Przy kilku dokładnych nazwach wybierz rok najbliższy folderowemu
         withy = [r for r in exact if _yr(r).isdigit()]
         if withy:
             withy.sort(key=lambda r: abs(int(_yr(r)) - hy))
@@ -396,439 +318,267 @@ def pick_candidate(results, nquery, hint_year):
     return None
 
 
-def resolve_series(tmdb, query, tmdbid_known, hint_year, cache, overrides):
-    nq = normalize(query)
-    # Override ma pierwszeństwo nad cache zapytań (by nowy wpis nadpisał stary wynik)
-    if not tmdbid_known and nq in overrides:
-        okey = f'ov:{overrides[nq]}'
-        if okey in cache:
-            return cache[okey]
-        try:
-            res = to_result(tmdb.get_tv(overrides[nq]))
-        except requests.RequestException as exc:
-            res = {'ok': False, 'reason': f'błąd TMDB: {exc}', 'candidates': []}
-        cache[okey] = res
-        return res
-
-    key = f'id:{tmdbid_known}' if tmdbid_known else f'q:{nq}|{hint_year}'
-    if key in cache:
-        return cache[key]
+def resolve_series(tmdb, query, tmdbid_known, hint_year):
+    """Return {'ok':True,'id','name','year'} or {'ok':False,'reason'}."""
     try:
         if tmdbid_known:
-            res = to_result(tmdb.get_tv(tmdbid_known))
-        else:
-            results = tmdb.search_tv(query)
-            chosen = pick_candidate(results, normalize(query), hint_year)
-            cand_source = results
-            # Gdy pełna nazwa nic nie zwraca, spróbuj krótszych wariantów
-            # (ucinanie końcowych słów), ale akceptuj tylko dokładne dopasowanie nazwy.
-            if not chosen and not results:
-                words = query.split()
-                for cut in range(len(words) - 1, 1, -1):
-                    q = ' '.join(words[:cut])
-                    r2 = tmdb.search_tv(q)
-                    if not r2:
-                        continue
-                    cand_source = r2
-                    nq = normalize(q)
-                    exact = [x for x in r2
-                             if normalize(x.get('name', '')) == nq
-                             or normalize(x.get('original_name', '')) == nq]
-                    if exact:
-                        chosen = pick_candidate(exact, nq, hint_year) or exact[0]
-                        break
-            if chosen:
-                res = to_result(chosen)
-            else:
-                if not cand_source:
-                    reason = 'brak wyników TMDB'
-                else:
-                    reason = f'{len(cand_source)} wyników, brak jednoznacznego'
-                cands = [{'id': r.get('id'), 'name': r.get('name'), 'year': _yr(r)}
-                         for r in cand_source[:5]]
-                res = {'ok': False, 'reason': reason, 'candidates': cands}
+            return to_result(tmdb.get_tv(tmdbid_known))
+        nq = normalize(query)
+        results = tmdb.search_tv(query)
+        chosen = pick_candidate(results, nq, hint_year)
+        cand_source = results
+        if not chosen and not results:
+            words = query.split()
+            for cut in range(len(words) - 1, 1, -1):
+                r2 = tmdb.search_tv(' '.join(words[:cut]))
+                if not r2:
+                    continue
+                cand_source = r2
+                nq2 = normalize(' '.join(words[:cut]))
+                exact = [x for x in r2
+                         if normalize(_name(x)) == nq2]
+                if exact:
+                    chosen = pick_candidate(exact, nq2, hint_year) or exact[0]
+                    break
+        if chosen:
+            return to_result(chosen)
+        reason = ('no TMDB results' if not cand_source
+                  else f'{len(cand_source)} results, no unambiguous match')
+        return {'ok': False, 'reason': reason}
     except requests.RequestException as exc:
-        res = {'ok': False, 'reason': f'błąd TMDB: {exc}', 'candidates': []}
-    cache[key] = res
-    return res
+        return {'ok': False, 'reason': f'TMDB error: {exc}'}
 
 
-# --------------------------- sprzątanie ---------------------------
+# --------------------------- logging ---------------------------
 
-def build_cleanup_lines(root, keep_vsmeta=False):
-    """Polecenia powłoki: skasuj WSZYSTKIE katalogi w bibliotece, w których poza
-    śmieciami nic nie ma — od dołu do góry (także zagnieżdżone). Katalog z plikiem
-    wideo lub inną realną zawartością zostaje nietknięty.
-
-    Za śmieci uznaje: @eaDir (Synology), DS_Store/.DS_Store, ._* (macOS),
-    Thumbs.db, desktop.ini, @SynoResource, .@__thumb oraz (domyślnie) pliki
-    .vsmeta (metadane Synology Video Station, zbędne dla Jellyfin)."""
-    qroot = shlex.quote(root)
-    junk = r'@eaDir|\.?DS_Store|\._.*|Thumbs\.db|@SynoResource|\.@__thumb|desktop\.ini'
-    lines = []
-    if not keep_vsmeta:
-        junk += r'|.*\.vsmeta'
-        # Najpierw usuń WSZYSTKIE pliki .vsmeta w całej bibliotece (także tam, gdzie są filmy)
-        lines += [
-            f"VSN=$(find {qroot} -type f -name '*.vsmeta' 2>/dev/null | wc -l)",
-            f"find {qroot} -type f -name '*.vsmeta' -exec rm -f -- {{}} + 2>/dev/null",
-            "printf 'USUNIETO VSMETA: %s\\n' \"$VSN\"",
-        ]
-    lines += [
-        f"JUNK={shlex.quote(junk)}",
-        f"find {qroot} -depth -type d 2>/dev/null | while IFS= read -r d; do",
-        f"  [ \"$d\" = {qroot} ] && continue",
-        "  case \"$d\" in */@eaDir|*/@eaDir/*) continue;; esac",
-        "  if [ -z \"$(ls -A \"$d\" 2>/dev/null | grep -vxE \"$JUNK\")\" ]; then",
-        "    rm -rf -- \"$d\" 2>/dev/null && printf 'USUNIETO KATALOG: %s\\n' \"$d\"",
-        "  fi",
-        "done",
-    ]
-    return lines
+def setup_logging(log_path):
+    log.setLevel(logging.INFO)
+    log.handlers.clear()
+    fmt = logging.Formatter('%(asctime)s  %(levelname)s  %(message)s', '%Y-%m-%d %H:%M:%S')
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(fmt)
+    log.addHandler(ch)
+    if log_path:
+        try:
+            fh = logging.FileHandler(log_path, encoding='utf-8')
+            fh.setFormatter(fmt)
+            log.addHandler(fh)
+        except OSError as exc:
+            log.warning('Could not open log file (%s): %s', log_path, exc)
 
 
-# --------------------------- SSH ---------------------------
+# --------------------------- disk helpers ---------------------------
 
-def ssh_run(client, command, stdin_data=None):
-    sin, sout, serr = client.exec_command(command)
-    if stdin_data is not None:
-        sin.write(stdin_data)
-        sin.channel.shutdown_write()
-    out = sout.read().decode('utf-8', 'replace')
-    err = serr.read().decode('utf-8', 'replace')
-    code = sout.channel.recv_exit_status()
-    return code, out, err
+def free_name(dirn, new_base, claimed):
+    """Return a path under dirn for new_base; if taken, append ' - duplicateN'.
+    Returns (dest_path, dup_index) where dup_index == 0 means no collision."""
+    dest = os.path.join(dirn, new_base)
+    if dest not in claimed and not os.path.exists(dest):
+        return dest, 0
+    stem, ext = os.path.splitext(new_base)
+    n = 1
+    while True:
+        cand = os.path.join(dirn, f'{stem} - duplicate{n}{ext}')
+        if cand not in claimed and not os.path.exists(cand):
+            return cand, n
+        n += 1
 
 
-# --------------------------- główny przebieg ---------------------------
+def video_files_under(folder):
+    """All video files under folder (any depth), skipping Synology's @eaDir."""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(folder):
+        dirnames[:] = [d for d in dirnames if d != '@eaDir']
+        for f in filenames:
+            if os.path.splitext(f)[1].lower() in VIDEO_EXT:
+                out.append(os.path.join(dirpath, f))
+    out.sort()
+    return out
+
+
+# --------------------------- main flow ---------------------------
+
+class Stats:
+    def __init__(self):
+        self.folders_renamed = self.files_renamed = 0
+        self.duplicates = self.no_episode = self.unresolved = self.errors = 0
+        self.skipped_unchanged = 0
+
+
+def rename_episodes(show_name, folder_path, apply, stats):
+    """Rename every episode file under folder_path to '<show> SxxEyy.release.ext'
+    in place (within its own directory). Files already matching are left alone."""
+    claimed = set()
+    for src in video_files_under(folder_path):
+        base = os.path.basename(src)
+        dirn = os.path.dirname(src)
+        season_hint = season_from_path(src[len(folder_path):].strip('/').split('/')[:-1])
+        parsed = parse_file(base, season_hint)
+        if not parsed:
+            stats.no_episode += 1
+            log.warning('    NO EPISODE MARKER: %s', base)
+            continue
+        season, episode, _title, release, ext = parsed
+        new_base = f'{show_name} S{season:02d}E{episode:02d}' + (f'.{release}' if release else '') + ext
+
+        if os.path.join(dirn, new_base) == src:
+            continue  # already named correctly
+
+        dest, dup_n = free_name(dirn, new_base, claimed)
+        if dup_n:
+            stats.duplicates += 1
+            new_base = os.path.basename(dest)
+            log.warning('    DUPLICATE: "%s" — name taken, assigning "%s"', base, new_base)
+        claimed.add(dest)
+        if apply:
+            try:
+                os.rename(src, dest)
+                stats.files_renamed += 1
+                log.info('    OK: %s  ->  %s', base, new_base)
+            except OSError as exc:
+                stats.errors += 1
+                log.error('    RENAME ERROR "%s": %s', base, exc)
+        else:
+            stats.files_renamed += 1
+            log.info('    RENAME: %s  ->  %s', base, new_base)
+
 
 def main():
-    ap = argparse.ArgumentParser(description='Porządkowanie seriali pod Jellyfin (SSH + TMDB).')
-    ap.add_argument('--config', default='konfiguracja_jellyfin.txt')
-    ap.add_argument('--overrides', default='tmdb_overrides.txt')
-    ap.add_argument('--apply', action='store_true')
-    ap.add_argument('--dry-run', action='store_true')
+    ap = argparse.ArgumentParser(
+        description='Organize a TV series library and tag folders with TMDB ids (local).')
+    ap.add_argument('--dir', '--path', dest='path', default=None,
+                    help='series library directory (required unless path= is set in config.txt)')
+    ap.add_argument('--config', default=os.path.join(SCRIPT_DIR, 'config.txt'))
+    ap.add_argument('--apply', action='store_true', help='execute changes (preview by default)')
+    ap.add_argument('--dry-run', action='store_true', help='force preview')
     ap.add_argument('--api-key', default=None)
     ap.add_argument('--language', default=None)
-    ap.add_argument('--path', default=None)
-    ap.add_argument('--cleanup-empty', action='store_true',
-                    help='(domyślnie włączone przy --apply) usuwa puste stare katalogi')
-    ap.add_argument('--no-cleanup-empty', action='store_true',
-                    help='nie usuwaj pustych katalogów po przeniesieniu')
-    ap.add_argument('--cleanup-only', action='store_true',
-                    help='tylko usuń puste katalogi w bibliotece (bez TMDB i przenoszenia)')
-    ap.add_argument('--keep-vsmeta', action='store_true',
-                    help='nie traktuj plików .vsmeta jako śmieci (zachowaj je)')
-    ap.add_argument('--dedupe-only', action='store_true',
-                    help='usuń duplikaty tego samego odcinka (zostaje największy plik); '
-                         'bez --apply tylko pokazuje')
-    ap.add_argument('--single-as-e01', action='store_true',
-                    help='folder z JEDNYM nierozpoznanym plikiem -> S01E01')
-    ap.add_argument('--cache', default=None,
-                    help='plik cache dopasowań TMDB (domyślnie tmdb_cache.json)')
-    ap.add_argument('--no-cache', action='store_true', help='nie używaj cache')
-    ap.add_argument('--log', default=None,
-                    help='plik logów przebiegów (domyślnie jellyfin.log)')
-    ap.add_argument('--no-log', action='store_true', help='nie zapisuj logów')
+    ap.add_argument('--log', default=None, help='log file path (default: jseries.log)')
+    ap.add_argument('--no-log', action='store_true', help='do not write a log file')
+    ap.add_argument('--cache', default=None, help='scan cache path (default: jseries_cache.json)')
+    ap.add_argument('--no-cache', action='store_true',
+                    help='ignore the cache and rescan every folder')
     args = ap.parse_args()
 
     cfg = read_config(args.config)
-    for req in ('host', 'user', 'password'):
-        if not cfg.get(req):
-            print(f'Brak "{req}" w {args.config}', file=sys.stderr)
-            sys.exit(1)
 
     root = (args.path or cfg.get('path') or '').rstrip('/')
-    if not root:
-        print('Brak ścieżki biblioteki (path).', file=sys.stderr)
-        sys.exit(1)
-
     api_key = args.api_key or os.environ.get('TMDB_API_KEY') or cfg.get('tmdb_api_key')
-    if not args.cleanup_only and (not api_key or api_key.startswith('TU_WPISZ')):
-        print('Brak klucza TMDB (--api-key / TMDB_API_KEY / tmdb_api_key w konfiguracji).',
-              file=sys.stderr)
-        sys.exit(1)
-
     language = args.language or cfg.get('tmdb_language') or 'en-US'
-    apply = args.apply or cfg.get('tryb', 'podglad').lower().startswith('wykonaj')
+    apply = args.apply or cfg.get('mode', 'preview').lower().startswith('apply')
     if args.dry_run:
         apply = False
+    log_path = None if args.no_log else (args.log or cfg.get('log_path')
+                                         or os.path.join(SCRIPT_DIR, 'jseries.log'))
+    cache_path = None if args.no_cache else (args.cache or cfg.get('cache_path')
+                                             or os.path.join(SCRIPT_DIR, 'jseries_cache.json'))
 
-    overrides = load_overrides(args.overrides)
-    tmdb = Tmdb(api_key, language) if api_key else None
+    setup_logging(log_path)
 
-    cache_path = None if args.no_cache else (args.cache or cfg.get('cache_path') or 'tmdb_cache.json')
-    log_path = None if args.no_log else (args.log or cfg.get('log_path') or 'jellyfin.log')
-
-    print(f"Łączę: {cfg['user']}@{cfg['host']}:{cfg.get('port', '22')}")
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(cfg['host'], port=int(cfg.get('port', '22')),
-                       username=cfg['user'], password=cfg['password'],
-                       look_for_keys=False, allow_agent=False, timeout=20)
-    except Exception as exc:  # noqa: BLE001
-        print(f'Nie udało się połączyć: {exc}', file=sys.stderr)
+    if not root:
+        log.error('No library directory. Pass --dir /path (or set path= in config.txt).')
+        sys.exit(1)
+    if not os.path.isdir(root):
+        log.error('Directory does not exist: %s', root)
+        sys.exit(1)
+    if not api_key or api_key.startswith('PUT_YOUR'):
+        log.error('No TMDB key (--api-key / TMDB_API_KEY / tmdb_api_key in config.txt).')
         sys.exit(1)
 
-    code, _o, _e = ssh_run(client, f'test -d {shlex.quote(root)}')
-    if code != 0:
-        print(f'Ścieżka nie istnieje na NAS-ie: {root}', file=sys.stderr)
-        client.close()
-        sys.exit(1)
+    tmdb = Tmdb(api_key, language)
 
-    # Tryb: samo sprzątanie pustych katalogów (bez TMDB i przenoszenia)
-    if args.cleanup_only:
-        print(f'Biblioteka: {root}')
-        print('Tryb: TYLKO SPRZĄTANIE pustych katalogów')
-        _c, out, err = ssh_run(client, 'sh -s',
-                               stdin_data='\n'.join(build_cleanup_lines(root, args.keep_vsmeta)) + '\n')
-        if out:
-            print(out, end='')
-        if err.strip():
-            print(err, file=sys.stderr, end='')
-        removed = sum(1 for ln in out.split('\n') if ln.startswith('USUNIETO KATALOG:'))
-        vsm = next((ln.split(':', 1)[1].strip()
-                    for ln in out.split('\n') if ln.startswith('USUNIETO VSMETA:')), None)
-        client.close()
-        if vsm is not None:
-            print(f'Usunięto plików .vsmeta: {vsm}')
-        print(f'Usunięto pustych katalogów: {removed}')
-        return
+    # Each immediate subdirectory of the library root is one show.
+    series_dirs = sorted(d for d in os.listdir(root)
+                         if d != '@eaDir' and os.path.isdir(os.path.join(root, d)))
 
-    # Tryb: usuwanie duplikatów tego samego odcinka
-    if args.dedupe_only:
-        print(f'Biblioteka: {root}')
-        print('Tryb: USUWANIE DUPLIKATÓW (ten sam odcinek) '
-              + ('— WYKONANIE' if apply else '— PODGLĄD (dodaj --apply aby skasować)'))
-        _c, out, err = ssh_run(client, f"find {shlex.quote(root)} -type f -printf '%s\\t%p\\n'")
-        if _c != 0 or not out.strip():
-            _c, out, err = ssh_run(
-                client, f"find {shlex.quote(root)} -type f -exec stat -c '%s\t%n' -- {{}} +")
-        groups = {}
-        for line in out.split('\n'):
-            if '\t' not in line:
-                continue
-            size_s, path = line.split('\t', 1)
-            base = path.rsplit('/', 1)[-1]
-            if os.path.splitext(base)[1].lower() not in VIDEO_EXT:
-                continue
-            mk = find_marker(os.path.splitext(base)[0])
-            if not mk:
-                continue
-            _s, _e2, season, episode = mk
-            if season is None:
-                season = 1
-            try:
-                size = int(size_s)
-            except ValueError:
-                size = 0
-            d = path.rsplit('/', 1)[0]
-            groups.setdefault((d, season, episode), []).append((size, path))
+    cache = {} if not cache_path else load_cache(cache_path)
 
-        losers = []
-        for (d, season, episode), items in sorted(groups.items()):
-            if len(items) < 2:
-                continue
-            items.sort(key=lambda x: (-x[0], x[1]))  # największy pierwszy, potem nazwa
-            keep = items[0]
-            print(f'S{season:02d}E{episode:02d} w {d[len(root):].lstrip("/")}:')
-            print(f'  ZOSTAJE:  {keep[1].rsplit("/", 1)[-1]}  ({keep[0]} B)')
-            for sz, p in items[1:]:
-                print(f'  DUPLIKAT: {p.rsplit("/", 1)[-1]}  ({sz} B)')
-                losers.append(p)
-
-        if not losers:
-            print('Nie znaleziono duplikatów.')
-            client.close()
-            return
-
-        if apply:
-            script = '\n'.join(
-                f'rm -f -- {shlex.quote(p)} && printf "USUNIETO: %s\\n" {shlex.quote(p)}'
-                for p in losers) + '\n'
-            _c, o, e = ssh_run(client, 'sh -s', stdin_data=script)
-            if o:
-                print('---')
-                print(o, end='')
-            if e.strip():
-                print(e, file=sys.stderr, end='')
-            n = sum(1 for ln in o.split('\n') if ln.startswith('USUNIETO:'))
-            client.close()
-            print(f'\nUsunięto duplikatów: {n}')
-        else:
-            client.close()
-            print(f'\nDuplikatów do usunięcia: {len(losers)}  (dodaj --apply aby skasować)')
-        return
-
-    code, out, err = ssh_run(client, f'find {shlex.quote(root)} -type f')
-    if code != 0:
-        print(f'Nie udało się wylistować plików: {err.strip()}', file=sys.stderr)
-        client.close()
-        sys.exit(1)
-
-    all_files = [p for p in out.split('\n') if p]
-
-    # Ile plików wideo jest w każdym katalogu (dla trybu --single-as-e01)
-    dir_video_count = {}
-    video_files = []
-    for full in all_files:
-        base = full.rsplit('/', 1)[-1]
-        if os.path.splitext(base)[1].lower() in VIDEO_EXT:
-            video_files.append(full)
-            parent = full.rsplit('/', 1)[0]
-            dir_video_count[parent] = dir_video_count.get(parent, 0) + 1
-
-    groups = {}          # key -> {query, tmdbid, hint_year, files:[(full,s,e,release,ext)]}
-    skipped_files = []
-
-    for full in video_files:
-        base = full.rsplit('/', 1)[-1]
-        parent = full.rsplit('/', 1)[0]
-
-        rel = full[len(root):].lstrip('/')
-        parts = rel.split('/')
-        ancestors = parts[:-1]
-
-        season_hint = season_from_path(ancestors)
-        parsed = parse_file(base, season_hint)
-        if not parsed:
-            if args.single_as_e01 and dir_video_count.get(parent, 0) == 1:
-                t, rel_tags, fext = parse_unnumbered(base)
-                parsed = (1, 1, t, rel_tags, fext)
-            else:
-                skipped_files.append((full, 'nie rozpoznano odcinka'))
-                continue
-        season, episode, title_from_file, release, fext = parsed
-
-        tmdbid_known = None
-        for a in ancestors:
-            m = RE_TMDBID.search(a)
-            if m:
-                tmdbid_known = int(m.group(1))
-                break
-
-        query = series_source_name(ancestors, title_from_file)
-        hint_year = series_year_hint(ancestors, base)
-        key = f'id:{tmdbid_known}' if tmdbid_known else f'q:{normalize(query)}'
-        g = groups.setdefault(key, {'query': query, 'tmdbid': tmdbid_known,
-                                    'hint_year': hint_year, 'files': []})
-        if not g['hint_year'] and hint_year:
-            g['hint_year'] = hint_year
-        g['files'].append((full, season, episode, release, fext))
-
-    cache = load_cache(cache_path)
-    cache_loaded = len(cache)
-    plan = []
-    unresolved = []
-    planned = {}          # dest -> src (do wykrywania kolizji)
-    collisions = []
-
-    for g in groups.values():
-        res = resolve_series(tmdb, g['query'], g['tmdbid'], g['hint_year'], cache, overrides)
-        if not res.get('ok'):
-            unresolved.append((g['query'], g['hint_year'], res.get('reason', '?'),
-                               res.get('candidates', []), len(g['files'])))
-            continue
-        name, year, tid = res['name'], res['year'], res['id']
-        folder = f'{name} ({year}) [tmdbid-{tid}]' if year else f'{name} [tmdbid-{tid}]'
-        for full, season, episode, release, fext in g['files']:
-            new_base = f'{name} S{season:02d}E{episode:02d}'
-            if release:
-                new_base += f'.{release}'
-            new_base += fext
-            dest = f'{root}/{folder}/Season {season:02d}/{new_base}'
-            if dest == full:
-                continue
-            if dest in planned:
-                collisions.append((full, planned[dest], dest))
-                continue
-            planned[dest] = full
-            plan.append((full, dest))
-
-    # Zapisz cache dopasowań TMDB (nowe rozwiązane seriale nie będą odpytywane ponownie)
+    log.info('==== START ==== library: %s', root)
+    log.info('Mode: %s', 'APPLY' if apply else 'PREVIEW (no changes, add --apply)')
     if cache_path:
+        log.info('Cache: %s (%d shows known)', cache_path, len(cache))
+    log.info('Series folders found: %d', len(series_dirs))
+
+    stats = Stats()
+    folder_claimed = set()
+
+    for i, folder in enumerate(series_dirs, 1):
+        cur_path = os.path.join(root, folder)
+        count = len(video_files_under(cur_path))
+
+        # Cache shortcut: a folder that already carries an id and whose video-file
+        # count is unchanged since last time is skipped (and TMDB is not queried).
+        m = RE_TMDBID.search(folder)
+        if m and cache_path:
+            cached = cache.get(str(int(m.group(1))))
+            if cached and cached.get('count') == count:
+                stats.skipped_unchanged += 1
+                log.info('[%d/%d] UNCHANGED (%d episodes): %s/', i, len(series_dirs),
+                         count, folder)
+                continue
+
+        # Id read straight from the folder name (re-scan case) or resolved by title.
+        if m:
+            res = resolve_series(tmdb, '', int(m.group(1)), None)
+        else:
+            res = resolve_series(tmdb, clean_query(folder), None, year_from_text(folder))
+
+        if not res.get('ok'):
+            stats.unresolved += 1
+            log.warning('[%d/%d] NO MATCH: %s/ — %s', i, len(series_dirs), folder,
+                        res.get('reason', '?'))
+            continue
+
+        name, yr, tid = res['name'], res['year'], res['id']
+        new_folder = f'{name} ({yr}) [tmdbid-{tid}]' if yr else f'{name} [tmdbid-{tid}]'
+
+        # Rename the series folder in place (contents stay inside it).
+        if folder != new_folder:
+            dest, dup_n = free_name(root, new_folder, folder_claimed)
+            if dup_n:
+                stats.duplicates += 1
+                new_folder = os.path.basename(dest)
+                log.warning('[%d/%d] DUPLICATE FOLDER: "%s/" — name taken, assigning "%s/"',
+                            i, len(series_dirs), folder, new_folder)
+            folder_claimed.add(dest)
+            if apply:
+                try:
+                    os.rename(cur_path, dest)
+                    cur_path = dest
+                    stats.folders_renamed += 1
+                    log.info('[%d/%d] FOLDER: %s/  ->  %s/', i, len(series_dirs), folder, new_folder)
+                except OSError as exc:
+                    stats.errors += 1
+                    log.error('[%d/%d] FOLDER RENAME ERROR "%s/": %s',
+                              i, len(series_dirs), folder, exc)
+                    continue
+            else:
+                log.info('[%d/%d] FOLDER: %s/  ->  %s/', i, len(series_dirs), folder, new_folder)
+        else:
+            folder_claimed.add(cur_path)
+            log.info('[%d/%d] FOLDER OK: %s/', i, len(series_dirs), folder)
+
+        # Tidy the episode files inside (in place), using the proper show title.
+        rename_episodes(name, cur_path, apply, stats)
+
+        # Remember this show's episode count so an unchanged folder is skipped next run.
+        # (Only in apply mode — a preview does not rename, so nothing is settled yet.)
+        if cache_path and apply:
+            cache[str(tid)] = {'name': name, 'year': yr, 'count': count}
+
+    if cache_path and apply:
         save_cache(cache_path, cache)
 
-    print(f'Biblioteka: {root}')
-    print('Tryb: ' + ('WYKONANIE' if apply else 'PODGLĄD (nic nie zmieniam)'))
-    if cache_path:
-        ok_now = sum(1 for v in cache.values() if isinstance(v, dict) and v.get('ok'))
-        print(f'Cache TMDB: {cache_path} (wczytano: {cache_loaded}, zapisano: {ok_now})')
-    if log_path:
-        print(f'Log: {log_path}')
-    print(f'Plików wideo do zmiany: {len(plan)}')
-    print('---')
-    for src, dest in plan:
-        print(src[len(root):].lstrip('/'))
-        print('   ->  ' + dest[len(root):].lstrip('/'))
-
-    moved = 0
-    skipped_exist = 0
-    removed_dirs = 0
-    apply_output = ''
-    if apply:
-        lines = []
-        for src, dest in plan:
-            dest_dir = dest.rsplit('/', 1)[0]
-            qsrc, qdst, qdir = shlex.quote(src), shlex.quote(dest), shlex.quote(dest_dir)
-            lines.append(
-                f'mkdir -p {qdir}; '
-                f'if [ -e {qdst} ]; then printf "POMIJAM (istnieje): %s\\n" {qdst}; '
-                f'else mv -- {qsrc} {qdst} && printf "OK: %s\\n" {qdst}; fi'
-            )
-        if not args.no_cleanup_empty:
-            lines += build_cleanup_lines(root, args.keep_vsmeta)
-        if lines:
-            _c, out, err = ssh_run(client, 'sh -s', stdin_data='\n'.join(lines) + '\n')
-            if out:
-                print('---')
-                print(out, end='')
-            if err.strip():
-                print(err, file=sys.stderr, end='')
-            apply_output = out
-            moved = sum(1 for ln in out.split('\n') if ln.startswith('OK:'))
-            skipped_exist = sum(1 for ln in out.split('\n') if ln.startswith('POMIJAM'))
-            removed_dirs = sum(1 for ln in out.split('\n') if ln.startswith('USUNIETO KATALOG:'))
-            vsm = next((ln.split(':', 1)[1].strip()
-                        for ln in out.split('\n') if ln.startswith('USUNIETO VSMETA:')), None)
-            if vsm is not None and vsm != '0':
-                print(f'Usunięto plików .vsmeta: {vsm}')
-            if removed_dirs:
-                print(f'Usunięto pustych katalogów: {removed_dirs}')
-
-    client.close()
-
-    write_log(log_path, root, apply, plan, moved, skipped_exist, apply_output,
-              collisions, skipped_files, unresolved)
-
-    print('\n==================== PODSUMOWANIE ====================')
-    if apply:
-        print(f'Przeniesiono/zmieniono: {moved}, pominięto (istniały): {skipped_exist}')
-    else:
-        print(f'Zaplanowano zmian: {len(plan)}  (podgląd — dodaj --apply aby wykonać)')
-
-    if collisions:
-        print(f'\nKolizje (dwa pliki -> ta sama nazwa docelowa): {len(collisions)}')
-        for src, other, dest in collisions[:20]:
-            print(f'  {src}')
-            print(f'  oraz {other}')
-            print(f'  -> {dest}')
-
-    if skipped_files:
-        print(f'\nPominięte pliki ({len(skipped_files)}):')
-        for full, why in skipped_files[:40]:
-            print(f'  [{why}] {full}')
-
-    if unresolved:
-        print(f'\nSeriale bez jednoznacznego dopasowania TMDB ({len(unresolved)}):')
-        for query, hint, reason, cands, nfiles in unresolved:
-            hint_s = f', rok z folderu: {hint}' if hint else ''
-            print(f'  "{query}"  — {reason}{hint_s}  ({nfiles} plik(ów))')
-            for c in cands:
-                print(f'      kandydat: {c["name"]} ({c["year"]})  tmdbid-{c["id"]}')
-        print('\n  Aby wymusić dopasowanie, dopisz do tmdb_overrides.txt, np.:')
-        print('      Nazwa serialu = 308975')
+    log.info('==== DONE ====')
+    fverb = 'Folders renamed' if apply else 'Folders to rename'
+    everb = 'episodes renamed' if apply else 'episodes to rename'
+    log.info('%s: %d | %s: %d | unchanged (skipped by cache): %d | suffixed duplicates: %d | '
+             'no episode marker: %d | folders without match: %d | errors: %d',
+             fverb, stats.folders_renamed, everb, stats.files_renamed,
+             stats.skipped_unchanged, stats.duplicates,
+             stats.no_episode, stats.unresolved, stats.errors)
+    if not apply:
+        log.info('This was a PREVIEW — add --apply to execute changes.')
 
 
 if __name__ == '__main__':

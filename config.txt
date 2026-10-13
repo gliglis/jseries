@@ -1,24 +1,12 @@
-# Konfiguracja porządkowania seriali pod Jellyfin (zapis: klucz=wartość).
+# Configuration (key=value). Runs locally on the NAS — no SSH.
 
-# --- Logowanie do NAS (SSH) ---
-host=
-port=
-user=ar
-password=
-
-# Katalog-BIBLIOTEKA, który zawiera FOLDERY seriali (nie pojedynczy serial).
-# To tutaj powstaną/zostaną uporządkowane foldery "Nazwa (ROK) [tmdbid-ID]".
-path=/volume1/video/TV/Dla dzieci odcinkowe
-
-# --- TMDB ---
-# Klucz v3 (API Key) LUB token v4 (Bearer). Program sam rozpozna typ.
-# Darmowy klucz: https://www.themoviedb.org/settings/api
+# --- TMDB (required) ---
 tmdb_api_key=
-
-# Język nazw pobieranych z TMDB. en-US daje nazwy angielskie (jak w przykładach),
-# pl-PL dałoby polskie tytuły tam, gdzie TMDB je ma.
 tmdb_language=en-US
 
-# tryb=podglad (domyślnie) albo tryb=wykonaj.
-# Flaga --apply w linii poleceń ma pierwszeństwo nad tym ustawieniem.
-tryb=podglad
+# mode=preview (default) or mode=apply.
+# The --apply command-line flag takes precedence over this setting.
+mode=preview
+
+# Optional: library directory (instead of passing --dir on the command line).
+# path=/volume1/video/Series
