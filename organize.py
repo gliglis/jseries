@@ -41,18 +41,19 @@ import logging
 import os
 import re
 import sys
+import time
 import unicodedata
-
-try:
-    import requests
-except ImportError:
-    print('Missing the requests library. Install it: pip3 install requests', file=sys.stderr)
-    sys.exit(1)
+import urllib.error
+import urllib.parse
+import urllib.request
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 VIDEO_EXT = {'.ts', '.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.mpg', '.mpeg', '.m2ts'}
+# Companion files that belong to an episode and must follow its rename.
+SIDECAR_EXT = {'.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt', '.smi',
+               '.nfo', '.jpg', '.jpeg', '.png', '.tbn'}
 
 RE_TMDBID = re.compile(r'\[tmdbid-(\d+)\]', re.IGNORECASE)
 RE_YEAR_PAREN = re.compile(r'\((?:19|20)\d{2}\)')
@@ -265,35 +266,45 @@ def season_from_path(ancestors):
 # --------------------------- TMDB ---------------------------
 
 class Tmdb:
+    """Minimal TMDB client over the standard library (no 'requests' needed)."""
+
     def __init__(self, key, language):
         self.language = language
-        self.session = requests.Session()
+        self.headers = {'Accept': 'application/json'}
         self.v3 = None
         if key.count('.') >= 2 and len(key) > 50:
-            self.session.headers['Authorization'] = f'Bearer {key}'
+            self.headers['Authorization'] = f'Bearer {key}'
         else:
             self.v3 = key
 
-    def _params(self, extra=None):
-        p = {'language': self.language}
+    def _get(self, url, extra=None):
+        params = {'language': self.language}
         if self.v3:
-            p['api_key'] = self.v3
+            params['api_key'] = self.v3
         if extra:
-            p.update(extra)
-        return p
+            params.update(extra)
+        full = url + '?' + urllib.parse.urlencode(params)
+        req = urllib.request.Request(full, headers=self.headers)
+        last = None
+        for attempt in range(3):  # retry transient network/5xx errors with backoff
+            try:
+                with urllib.request.urlopen(req, timeout=25) as resp:
+                    return json.loads(resp.read().decode('utf-8'))
+            except urllib.error.HTTPError as exc:
+                if 400 <= exc.code < 500:
+                    raise
+                last = exc
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                last = exc
+            time.sleep(1.5 * (attempt + 1))
+        raise last
 
     def search_tv(self, query):
-        r = self.session.get('https://api.themoviedb.org/3/search/tv',
-                             params=self._params({'query': query, 'include_adult': 'false'}),
-                             timeout=25)
-        r.raise_for_status()
-        return r.json().get('results', [])
+        return self._get('https://api.themoviedb.org/3/search/tv',
+                         {'query': query, 'include_adult': 'false'}).get('results', [])
 
     def get_tv(self, tv_id):
-        r = self.session.get(f'https://api.themoviedb.org/3/tv/{tv_id}',
-                             params=self._params(), timeout=25)
-        r.raise_for_status()
-        return r.json()
+        return self._get(f'https://api.themoviedb.org/3/tv/{tv_id}')
 
 
 def _name(r):
@@ -363,7 +374,7 @@ def resolve_series(tmdb, query, tmdbid_known, hint_year):
         reason = ('no TMDB results' if not cand_source
                   else f'{len(cand_source)} results, no unambiguous match')
         return {'ok': False, 'reason': reason}
-    except requests.RequestException as exc:
+    except (urllib.error.URLError, OSError, ValueError) as exc:
         return {'ok': False, 'reason': f'TMDB error: {exc}'}
 
 
@@ -401,7 +412,79 @@ def drop_handler(fh):
         fh.close()
 
 
+def prune_logs(log_dir, prefix, keep_days):
+    """Delete <prefix>*.log files in log_dir older than keep_days (0 = keep all)."""
+    if not log_dir or not keep_days:
+        return
+    cutoff = time.time() - keep_days * 86400
+    try:
+        for f in os.listdir(log_dir):
+            if f.startswith(prefix) and f.endswith('.log'):
+                fp = os.path.join(log_dir, f)
+                if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
+                    os.remove(fp)
+    except OSError:
+        pass
+
+
+def acquire_lock(lock_path, stale_seconds=6 * 3600):
+    """Create an exclusive lock file. Returns True on success. A lock older than
+    stale_seconds is treated as abandoned and replaced. If locking is impossible
+    (e.g. a read-only directory), returns True so the run is not blocked."""
+    try:
+        if os.path.exists(lock_path) and time.time() - os.path.getmtime(lock_path) > stale_seconds:
+            os.remove(lock_path)
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode('ascii'))
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+    except OSError:
+        return True
+
+
+def release_lock(lock_path):
+    try:
+        os.remove(lock_path)
+    except OSError:
+        pass
+
+
 # --------------------------- disk helpers ---------------------------
+
+def rename_sidecars(dirn, old_base, new_base, apply):
+    """Rename companion files (subtitles, .nfo, artwork) that share the episode's
+    stem, so they keep matching after the episode is renamed. Returns the count."""
+    old_stem = os.path.splitext(old_base)[0]
+    new_stem = os.path.splitext(new_base)[0]
+    if old_stem == new_stem:
+        return 0
+    moved = 0
+    try:
+        entries = os.listdir(dirn)
+    except OSError:
+        return 0
+    for f in entries:
+        if not f.startswith(old_stem) or f == old_base:
+            continue
+        rem = f[len(old_stem):]
+        if not rem or rem[0] not in '.-':
+            continue
+        if os.path.splitext(f)[1].lower() not in SIDECAR_EXT:
+            continue
+        dest = os.path.join(dirn, new_stem + rem)
+        if os.path.exists(dest):
+            continue
+        if apply:
+            try:
+                os.rename(os.path.join(dirn, f), dest)
+            except OSError:
+                continue
+        moved += 1
+        log.info('      sidecar: %s  ->  %s', f, new_stem + rem)
+    return moved
+
 
 def free_name(dirn, new_base, claimed):
     """Return a path under dirn for new_base; if taken, append ' - duplicateN'.
@@ -436,7 +519,7 @@ class Stats:
     def __init__(self):
         self.folders_renamed = self.files_renamed = 0
         self.duplicates = self.no_episode = self.unresolved = self.errors = 0
-        self.skipped_unchanged = 0
+        self.skipped_unchanged = self.sidecars = 0
 
 
 def rename_episodes(show_name, folder_path, apply, stats):
@@ -469,12 +552,14 @@ def rename_episodes(show_name, folder_path, apply, stats):
                 os.rename(src, dest)
                 stats.files_renamed += 1
                 log.info('    OK: %s  ->  %s', base, new_base)
+                stats.sidecars += rename_sidecars(dirn, base, new_base, apply)
             except OSError as exc:
                 stats.errors += 1
                 log.error('    RENAME ERROR "%s": %s', base, exc)
         else:
             stats.files_renamed += 1
             log.info('    RENAME: %s  ->  %s', base, new_base)
+            stats.sidecars += rename_sidecars(dirn, base, new_base, apply)
 
 
 def process_root(root, tmdb, apply, cache, cache_path, folder_claimed, stats):
@@ -574,11 +659,16 @@ def main():
     if args.dry_run:
         apply = False
     log_dir = None if args.no_log else (args.log_dir or cfg.get('log_dir') or SCRIPT_DIR)
+    try:
+        keep_days = int(cfg.get('log_keep_days') or 0)
+    except ValueError:
+        keep_days = 0
     cache_path = None if args.no_cache else (args.cache or cfg.get('cache_path')
                                              or os.path.join(SCRIPT_DIR, 'jseries_cache.json'))
     datestr = datetime.date.today().isoformat()
 
     setup_console()
+    prune_logs(log_dir, 'jseries-', keep_days)
     main_log = add_file_handler(log_dir, f'jseries-{datestr}.log')
 
     if not given:
@@ -602,39 +692,49 @@ def main():
         log.error('None of the given paths is a directory.')
         sys.exit(1)
 
-    tmdb = Tmdb(api_key, language)
-    cache = {} if not cache_path else load_cache(cache_path)
-    stats = Stats()
-    folder_claimed = set()
+    # Prevent overlapping runs (e.g. a slow scheduled job still running).
+    lock_path = os.path.join(SCRIPT_DIR, 'jseries.lock')
+    if not acquire_lock(lock_path):
+        log.error('Another run is in progress (lock: %s). Exiting.', lock_path)
+        sys.exit(0)
 
-    log.info('==== START ==== %d path(s)', len(roots))
-    for i, root in enumerate(roots, 1):
-        log.info('  path%d = %s', i, root)
-    log.info('Mode: %s', 'APPLY' if apply else 'PREVIEW (no changes, add --apply)')
-    if cache_path:
-        log.info('Cache: %s (%d shows known)', cache_path, len(cache))
+    try:
+        tmdb = Tmdb(api_key, language)
+        cache = {} if not cache_path else load_cache(cache_path)
+        stats = Stats()
+        folder_claimed = set()
 
-    # Each path is processed separately and also gets its own dated log file,
-    # named by its index (path1, path2, ...). The full path is logged inside.
-    for i, root in enumerate(roots, 1):
-        path_log = add_file_handler(log_dir, f'jseries-path{i}-{datestr}.log')
-        process_root(root, tmdb, apply, cache, cache_path, folder_claimed, stats)
-        drop_handler(path_log)
+        log.info('==== START ==== %d path(s)', len(roots))
+        for i, root in enumerate(roots, 1):
+            log.info('  path%d = %s', i, root)
+        log.info('Mode: %s', 'APPLY' if apply else 'PREVIEW (no changes, add --apply)')
+        if cache_path:
+            log.info('Cache: %s (%d shows known)', cache_path, len(cache))
 
-    if cache_path and apply:
-        save_cache(cache_path, cache)
+        # Each path is processed separately and also gets its own dated log file,
+        # named by its index (path1, path2, ...). The full path is logged inside.
+        for i, root in enumerate(roots, 1):
+            path_log = add_file_handler(log_dir, f'jseries-path{i}-{datestr}.log')
+            process_root(root, tmdb, apply, cache, cache_path, folder_claimed, stats)
+            drop_handler(path_log)
 
-    log.info('==== DONE ====')
-    fverb = 'Folders renamed' if apply else 'Folders to rename'
-    everb = 'episodes renamed' if apply else 'episodes to rename'
-    log.info('%s: %d | %s: %d | unchanged (skipped by cache): %d | suffixed duplicates: %d | '
-             'no episode marker: %d | folders without match: %d | errors: %d',
-             fverb, stats.folders_renamed, everb, stats.files_renamed,
-             stats.skipped_unchanged, stats.duplicates,
-             stats.no_episode, stats.unresolved, stats.errors)
-    if not apply:
-        log.info('This was a PREVIEW — add --apply to execute changes.')
-    drop_handler(main_log)
+        if cache_path and apply:
+            save_cache(cache_path, cache)
+
+        log.info('==== DONE ====')
+        fverb = 'Folders renamed' if apply else 'Folders to rename'
+        everb = 'episodes renamed' if apply else 'episodes to rename'
+        log.info('%s: %d | %s: %d | sidecars: %d | unchanged (skipped by cache): %d | '
+                 'suffixed duplicates: %d | no episode marker: %d | '
+                 'folders without match: %d | errors: %d',
+                 fverb, stats.folders_renamed, everb, stats.files_renamed, stats.sidecars,
+                 stats.skipped_unchanged, stats.duplicates,
+                 stats.no_episode, stats.unresolved, stats.errors)
+        if not apply:
+            log.info('This was a PREVIEW — add --apply to execute changes.')
+    finally:
+        release_lock(lock_path)
+        drop_handler(main_log)
 
 
 if __name__ == '__main__':
