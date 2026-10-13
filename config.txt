@@ -8,5 +8,13 @@ tmdb_language=en-US
 # The --apply command-line flag takes precedence over this setting.
 mode=preview
 
-# Optional: library directory (instead of passing --dir on the command line).
+# Optional: directory for the dated log files (default: next to the script).
+# log_dir=/volume1/logs
+
+# Optional: delete log files older than N days (0 / unset = keep all).
+# log_keep_days=90
+
+# Optional: libraries to scan when no --dir is given on the command line.
+# Add one "path=" line per directory (no quotes needed, spaces are fine):
 # path=/volume1/video/Series
+# path=/volume1/video/Another series library

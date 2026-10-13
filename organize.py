@@ -112,6 +112,23 @@ def read_config(path):
     return cfg
 
 
+def config_paths(path):
+    """Return every 'path=' entry from the config, in order (one path per line).
+    Paths may contain spaces and need no quoting inside the config file."""
+    out = []
+    if not path or not os.path.isfile(path):
+        return out
+    with open(path, encoding='utf-8') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            if k.strip() == 'path' and v.strip():
+                out.append(v.strip())
+    return out
+
+
 def load_cache(path):
     """Load the scan cache: {tmdbid(str): {'name','year','count'}}."""
     if not path or not os.path.isfile(path):
@@ -550,7 +567,7 @@ def main():
 
     cfg = read_config(args.config)
 
-    given = args.dirs + args.paths or ([cfg['path']] if cfg.get('path') else [])
+    given = args.dirs + args.paths or config_paths(args.config)
     api_key = args.api_key or os.environ.get('TMDB_API_KEY') or cfg.get('tmdb_api_key')
     language = args.language or cfg.get('tmdb_language') or 'en-US'
     apply = args.apply or cfg.get('mode', 'preview').lower().startswith('apply')
