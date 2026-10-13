@@ -35,6 +35,7 @@ tmdb_api_key entry in config.txt located next to the script.
 """
 
 import argparse
+import datetime
 import json
 import logging
 import os
@@ -351,20 +352,42 @@ def resolve_series(tmdb, query, tmdbid_known, hint_year):
 
 # --------------------------- logging ---------------------------
 
-def setup_logging(log_path):
+LOG_FMT = logging.Formatter('%(asctime)s  %(levelname)s  %(message)s', '%Y-%m-%d %H:%M:%S')
+
+
+def setup_console():
     log.setLevel(logging.INFO)
     log.handlers.clear()
-    fmt = logging.Formatter('%(asctime)s  %(levelname)s  %(message)s', '%Y-%m-%d %H:%M:%S')
     ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(fmt)
+    ch.setFormatter(LOG_FMT)
     log.addHandler(ch)
-    if log_path:
-        try:
-            fh = logging.FileHandler(log_path, encoding='utf-8')
-            fh.setFormatter(fmt)
-            log.addHandler(fh)
-        except OSError as exc:
-            log.warning('Could not open log file (%s): %s', log_path, exc)
+
+
+def slug(text):
+    """Filesystem-safe fragment from a path's basename, for the log file name."""
+    s = re.sub(r'[^\w.-]+', '_', text.strip('/').split('/')[-1] or 'root')
+    return s.strip('_') or 'root'
+
+
+def add_file_handler(log_dir, name):
+    """Attach a file handler <log_dir>/<name>; return it (or None on failure)."""
+    if not log_dir:
+        return None
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        fh = logging.FileHandler(os.path.join(log_dir, name), encoding='utf-8')
+        fh.setFormatter(LOG_FMT)
+        log.addHandler(fh)
+        return fh
+    except OSError as exc:
+        log.warning('Could not open log file (%s): %s', os.path.join(log_dir, name), exc)
+        return None
+
+
+def drop_handler(fh):
+    if fh:
+        log.removeHandler(fh)
+        fh.close()
 
 
 # --------------------------- disk helpers ---------------------------
@@ -443,66 +466,14 @@ def rename_episodes(show_name, folder_path, apply, stats):
             log.info('    RENAME: %s  ->  %s', base, new_base)
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        description='Organize a TV series library and tag folders with TMDB ids (local).')
-    ap.add_argument('--dir', '--path', dest='path', default=None,
-                    help='series library directory (required unless path= is set in config.txt)')
-    ap.add_argument('--config', default=os.path.join(SCRIPT_DIR, 'config.txt'))
-    ap.add_argument('--apply', action='store_true', help='execute changes (preview by default)')
-    ap.add_argument('--dry-run', action='store_true', help='force preview')
-    ap.add_argument('--api-key', default=None)
-    ap.add_argument('--language', default=None)
-    ap.add_argument('--log', default=None, help='log file path (default: jseries.log)')
-    ap.add_argument('--no-log', action='store_true', help='do not write a log file')
-    ap.add_argument('--cache', default=None, help='scan cache path (default: jseries_cache.json)')
-    ap.add_argument('--no-cache', action='store_true',
-                    help='ignore the cache and rescan every folder')
-    args = ap.parse_args()
+def process_root(root, tmdb, apply, cache, cache_path, folder_claimed, stats):
+    """Tag and tidy every show folder under one library root, in place."""
+    series = sorted(d for d in os.listdir(root)
+                    if d != '@eaDir' and os.path.isdir(os.path.join(root, d)))
+    total = len(series)
+    log.info('---- path: %s  (%d series folders) ----', root, total)
 
-    cfg = read_config(args.config)
-
-    root = (args.path or cfg.get('path') or '').rstrip('/')
-    api_key = args.api_key or os.environ.get('TMDB_API_KEY') or cfg.get('tmdb_api_key')
-    language = args.language or cfg.get('tmdb_language') or 'en-US'
-    apply = args.apply or cfg.get('mode', 'preview').lower().startswith('apply')
-    if args.dry_run:
-        apply = False
-    log_path = None if args.no_log else (args.log or cfg.get('log_path')
-                                         or os.path.join(SCRIPT_DIR, 'jseries.log'))
-    cache_path = None if args.no_cache else (args.cache or cfg.get('cache_path')
-                                             or os.path.join(SCRIPT_DIR, 'jseries_cache.json'))
-
-    setup_logging(log_path)
-
-    if not root:
-        log.error('No library directory. Pass --dir /path (or set path= in config.txt).')
-        sys.exit(1)
-    if not os.path.isdir(root):
-        log.error('Directory does not exist: %s', root)
-        sys.exit(1)
-    if not api_key or api_key.startswith('PUT_YOUR'):
-        log.error('No TMDB key (--api-key / TMDB_API_KEY / tmdb_api_key in config.txt).')
-        sys.exit(1)
-
-    tmdb = Tmdb(api_key, language)
-
-    # Each immediate subdirectory of the library root is one show.
-    series_dirs = sorted(d for d in os.listdir(root)
-                         if d != '@eaDir' and os.path.isdir(os.path.join(root, d)))
-
-    cache = {} if not cache_path else load_cache(cache_path)
-
-    log.info('==== START ==== library: %s', root)
-    log.info('Mode: %s', 'APPLY' if apply else 'PREVIEW (no changes, add --apply)')
-    if cache_path:
-        log.info('Cache: %s (%d shows known)', cache_path, len(cache))
-    log.info('Series folders found: %d', len(series_dirs))
-
-    stats = Stats()
-    folder_claimed = set()
-
-    for i, folder in enumerate(series_dirs, 1):
+    for i, folder in enumerate(series, 1):
         cur_path = os.path.join(root, folder)
         count = len(video_files_under(cur_path))
 
@@ -513,8 +484,7 @@ def main():
             cached = cache.get(str(int(m.group(1))))
             if cached and cached.get('count') == count:
                 stats.skipped_unchanged += 1
-                log.info('[%d/%d] UNCHANGED (%d episodes): %s/', i, len(series_dirs),
-                         count, folder)
+                log.info('[%d/%d] UNCHANGED (%d episodes): %s/', i, total, count, folder)
                 continue
 
         # Id read straight from the folder name (re-scan case) or resolved by title.
@@ -525,8 +495,7 @@ def main():
 
         if not res.get('ok'):
             stats.unresolved += 1
-            log.warning('[%d/%d] NO MATCH: %s/ — %s', i, len(series_dirs), folder,
-                        res.get('reason', '?'))
+            log.warning('[%d/%d] NO MATCH: %s/ — %s', i, total, folder, res.get('reason', '?'))
             continue
 
         name, yr, tid = res['name'], res['year'], res['id']
@@ -539,24 +508,23 @@ def main():
                 stats.duplicates += 1
                 new_folder = os.path.basename(dest)
                 log.warning('[%d/%d] DUPLICATE FOLDER: "%s/" — name taken, assigning "%s/"',
-                            i, len(series_dirs), folder, new_folder)
+                            i, total, folder, new_folder)
             folder_claimed.add(dest)
             if apply:
                 try:
                     os.rename(cur_path, dest)
                     cur_path = dest
                     stats.folders_renamed += 1
-                    log.info('[%d/%d] FOLDER: %s/  ->  %s/', i, len(series_dirs), folder, new_folder)
+                    log.info('[%d/%d] FOLDER: %s/  ->  %s/', i, total, folder, new_folder)
                 except OSError as exc:
                     stats.errors += 1
-                    log.error('[%d/%d] FOLDER RENAME ERROR "%s/": %s',
-                              i, len(series_dirs), folder, exc)
+                    log.error('[%d/%d] FOLDER RENAME ERROR "%s/": %s', i, total, folder, exc)
                     continue
             else:
-                log.info('[%d/%d] FOLDER: %s/  ->  %s/', i, len(series_dirs), folder, new_folder)
+                log.info('[%d/%d] FOLDER: %s/  ->  %s/', i, total, folder, new_folder)
         else:
             folder_claimed.add(cur_path)
-            log.info('[%d/%d] FOLDER OK: %s/', i, len(series_dirs), folder)
+            log.info('[%d/%d] FOLDER OK: %s/', i, total, folder)
 
         # Tidy the episode files inside (in place), using the proper show title.
         rename_episodes(name, cur_path, apply, stats)
@@ -565,6 +533,79 @@ def main():
         # (Only in apply mode — a preview does not rename, so nothing is settled yet.)
         if cache_path and apply:
             cache[str(tid)] = {'name': name, 'year': yr, 'count': count}
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description='Organize a TV series library and tag folders with TMDB ids (local).')
+    ap.add_argument('paths', nargs='*', help='series library directory/directories (positional)')
+    ap.add_argument('--dir', '--path', dest='dirs', action='append', default=[], metavar='DIR',
+                    help='series library directory; repeat for several (e.g. --dir A --dir B)')
+    ap.add_argument('--config', default=os.path.join(SCRIPT_DIR, 'config.txt'))
+    ap.add_argument('--apply', action='store_true', help='execute changes (preview by default)')
+    ap.add_argument('--dry-run', action='store_true', help='force preview')
+    ap.add_argument('--api-key', default=None)
+    ap.add_argument('--language', default=None)
+    ap.add_argument('--log-dir', default=None,
+                    help='directory for dated log files (default: next to the script)')
+    ap.add_argument('--no-log', action='store_true', help='do not write log files')
+    ap.add_argument('--cache', default=None, help='scan cache path (default: jseries_cache.json)')
+    ap.add_argument('--no-cache', action='store_true',
+                    help='ignore the cache and rescan every folder')
+    args = ap.parse_args()
+
+    cfg = read_config(args.config)
+
+    given = args.dirs + args.paths or ([cfg['path']] if cfg.get('path') else [])
+    api_key = args.api_key or os.environ.get('TMDB_API_KEY') or cfg.get('tmdb_api_key')
+    language = args.language or cfg.get('tmdb_language') or 'en-US'
+    apply = args.apply or cfg.get('mode', 'preview').lower().startswith('apply')
+    if args.dry_run:
+        apply = False
+    log_dir = None if args.no_log else (args.log_dir or cfg.get('log_dir') or SCRIPT_DIR)
+    cache_path = None if args.no_cache else (args.cache or cfg.get('cache_path')
+                                             or os.path.join(SCRIPT_DIR, 'jseries_cache.json'))
+    datestr = datetime.date.today().isoformat()
+
+    setup_console()
+    main_log = add_file_handler(log_dir, f'jseries-{datestr}.log')
+
+    if not given:
+        log.error('No library directory. Pass --dir /path (or set path= in config.txt).')
+        sys.exit(1)
+    if not api_key or api_key.startswith('PUT_YOUR'):
+        log.error('No TMDB key (--api-key / TMDB_API_KEY / tmdb_api_key in config.txt).')
+        sys.exit(1)
+
+    # Keep existing directories only; drop duplicates / repeats by realpath.
+    seen, roots = set(), []
+    for p in given:
+        rp = os.path.realpath(p.rstrip('/'))
+        if not os.path.isdir(rp):
+            log.error('Not a directory, skipping: %s', p)
+            continue
+        if rp not in seen:
+            seen.add(rp)
+            roots.append(rp)
+    if not roots:
+        log.error('None of the given paths is a directory.')
+        sys.exit(1)
+
+    tmdb = Tmdb(api_key, language)
+    cache = {} if not cache_path else load_cache(cache_path)
+    stats = Stats()
+    folder_claimed = set()
+
+    log.info('==== START ==== libraries: %s', ', '.join(roots))
+    log.info('Mode: %s', 'APPLY' if apply else 'PREVIEW (no changes, add --apply)')
+    if cache_path:
+        log.info('Cache: %s (%d shows known)', cache_path, len(cache))
+
+    # Each path is processed separately and also gets its own dated log file.
+    for root in roots:
+        path_log = add_file_handler(log_dir, f'jseries-{slug(root)}-{datestr}.log')
+        process_root(root, tmdb, apply, cache, cache_path, folder_claimed, stats)
+        drop_handler(path_log)
 
     if cache_path and apply:
         save_cache(cache_path, cache)
@@ -579,6 +620,7 @@ def main():
              stats.no_episode, stats.unresolved, stats.errors)
     if not apply:
         log.info('This was a PREVIEW — add --apply to execute changes.')
+    drop_handler(main_log)
 
 
 if __name__ == '__main__':
