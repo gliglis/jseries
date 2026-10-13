@@ -363,12 +363,6 @@ def setup_console():
     log.addHandler(ch)
 
 
-def slug(text):
-    """Filesystem-safe fragment from a path's basename, for the log file name."""
-    s = re.sub(r'[^\w.-]+', '_', text.strip('/').split('/')[-1] or 'root')
-    return s.strip('_') or 'root'
-
-
 def add_file_handler(log_dir, name):
     """Attach a file handler <log_dir>/<name>; return it (or None on failure)."""
     if not log_dir:
@@ -596,14 +590,17 @@ def main():
     stats = Stats()
     folder_claimed = set()
 
-    log.info('==== START ==== libraries: %s', ', '.join(roots))
+    log.info('==== START ==== %d path(s)', len(roots))
+    for i, root in enumerate(roots, 1):
+        log.info('  path%d = %s', i, root)
     log.info('Mode: %s', 'APPLY' if apply else 'PREVIEW (no changes, add --apply)')
     if cache_path:
         log.info('Cache: %s (%d shows known)', cache_path, len(cache))
 
-    # Each path is processed separately and also gets its own dated log file.
-    for root in roots:
-        path_log = add_file_handler(log_dir, f'jseries-{slug(root)}-{datestr}.log')
+    # Each path is processed separately and also gets its own dated log file,
+    # named by its index (path1, path2, ...). The full path is logged inside.
+    for i, root in enumerate(roots, 1):
+        path_log = add_file_handler(log_dir, f'jseries-path{i}-{datestr}.log')
         process_root(root, tmdb, apply, cache, cache_path, folder_claimed, stats)
         drop_handler(path_log)
 
