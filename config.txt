@@ -1,20 +1,20 @@
-# Configuration (key=value). Runs locally on the NAS — no SSH.
+# jseries — personal config (keep local, do NOT push to GitHub).
 
-# --- TMDB (required) ---
+# --- TMDB (required) — paste your key here ---
 tmdb_api_key=
 tmdb_language=en-US
 
-# mode=preview (default) or mode=apply.
-# The --apply command-line flag takes precedence over this setting.
-mode=preview
+# mode=preview (safe, no changes) or mode=apply (perform renames).
+mode=apply
 
-# Optional: directory for the dated log files (default: next to the script).
+# Delete log files older than N days (0 = keep all).
+log_keep_days=90
+
+# Optional: where dated log files go (default: next to the script).
 # log_dir=/volume1/logs
 
-# Optional: delete log files older than N days (0 / unset = keep all).
-# log_keep_days=90
+# Optional: scan cache path (default: jseries_cache.json next to the script).
+# cache_path=/volume1/homes/ar/Tools/jseries/jseries_cache.json
 
-# Optional: libraries to scan when no --dir is given on the command line.
-# Add one "path=" line per directory (no quotes needed, spaces are fine):
-# path=/volume1/video/Series
-# path=/volume1/video/Another series library
+# Series libraries to scan (one per line; spaces are fine, no quotes).
+path=
